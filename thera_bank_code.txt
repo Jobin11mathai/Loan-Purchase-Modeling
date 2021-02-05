@@ -1,0 +1,464 @@
+library(dplyr)
+library(sqldf)
+library(corrplot)
+library(reshape2)
+library(zipcode)
+library(factoextra)
+library(fpc)
+library(cluster)
+library(ggplot2)
+library(readr)
+library(Rtsne)
+library(randomForest)
+library(data.table)
+library(rpart)
+library(rpart.plot)
+library(scales)
+library(ROCR)
+library(ineq)
+library(rattle)
+library(RColorBrewer)
+
+setwd("C:/Users/reema.mukherjee/Documents/Great Lakes Mentor/solution_CART_RF/");
+cust_base=read.csv("thera_bank_dataset.csv",header=TRUE);
+
+#Check structure of data
+str(cust_base)
+
+#rename columns to more code friendly
+
+names(cust_base)[2]<-"age_in_years"
+names(cust_base)[3]<-"experience_in_years"
+names(cust_base)[4]<-"income_in_K_month"
+names(cust_base)[5]<-"zip_code"
+names(cust_base)[6]<-"family_size"
+names(cust_base)[10]<-"did_accept_personal_loan_offer"  #predictor variable
+names(cust_base)[11]<-"have_securities_acct"
+names(cust_base)[12]<-"have_deposit_account"
+names(cust_base)[13]<-"have_online_access"
+names(cust_base)[14]<-"have_CC"
+
+#Converting the categorical variables to factor from numeric
+
+cust_base$family_size_fact<-as.factor(cust_base$family_size)
+cust_base$Education_fact<-as.factor(cust_base$Education)
+cust_base$did_accept_personal_loan_offer_fact<-as.factor(cust_base$did_accept_personal_loan_offer)
+cust_base$have_securities_acct_fact<-as.factor(cust_base$have_securities_acct)
+cust_base$have_deposit_account_fact<-as.factor(cust_base$have_deposit_account)
+cust_base$have_online_access_fact<-as.factor(cust_base$have_online_access)
+cust_base$have_CC_fact<-as.factor(cust_base$have_CC)
+cust_base$zip_code_fact<-as.factor(cust_base$zip_code)
+
+#EDA
+
+summary(cust_base)
+
+#1. ID is only a dummy variable and can be removed from the dataset
+#2. There are negative values in professional experience years , which seems to be wrong data , need to replace all negative values with a 0
+#3. There are invalid zip codes (some 4 digit ones , which needs to be prefixed with 0)
+#4. Here we are dealing with imbalanced data , only 10% of the population accepted the offer
+#5. Majority of the customers do not have a securities account - 90%
+#6. Majority of the customers do not have a deposits account - 94%
+#7. Mortgage data is highly skewed , means only few customers have house mortgage
+#8. Age, professional experience have normal distribution
+
+# Check for correlation between continuous variables
+
+cust_base_cont_vars<-cust_base[,c(2:4,7,9)]
+
+corrmatrix<-cor(cust_base_cont_vars)
+corrplot(corrmatrix,method='circle',type='upper',order='FPC')
+
+#1. We can see there is high degree of correlation between Age of the person and professional experience
+#2. We can see there is some degree of correlation between income and spending on credit card
+#3. We can see there is some degree of correlation between income and mortgage amount
+
+# Correlation matrix plotted corroborates the above fact, so we will drop professional experience column and keep only age in years
+# But there is no significant correlation between years of experience and income per month
+
+
+# Checking for outliers
+
+# For Mortgage only those records which are greater than 0
+
+df.mort <- melt(cust_base_cont_vars[cust_base_cont_vars[5]>0,5])
+df.mort$variable="Mortgage"
+
+ggplot(data = df.mort, aes(y=value)) + 
+  geom_boxplot() + facet_wrap(~variable,ncol = 4)
+
+# For rest of the variables
+
+df.rest <- melt(cust_base_cont_vars[cust_base_cont_vars[5]>0,-c(2,5)])
+ggplot(data = df.rest, aes(y=value)) + 
+  geom_boxplot() + facet_wrap(~variable,ncol = 4)
+
+#Row filter and column addition
+
+cust_base_final<-cust_base %>% filter(complete.cases(.))
+
+cust_base_final<-cust_base_final %>%
+mutate(have_multiple_relns=if_else(have_securities_acct+have_CC+have_deposit_account>1,1,0)) 
+
+cust_base_final<-cust_base_final %>%
+  mutate(have_mortgage=if_else(Mortgage>0,1,0)) 
+
+#Convert them into factors
+
+cust_base_final$have_multiple_relns_fact<-as.factor(cust_base_final$have_multiple_relns)
+cust_base_final$have_mortgage_fact<-as.factor(cust_base_final$have_mortgage)
+
+#Scale continuous variables in subset data 
+
+cust_base_final$age_in_years_scaled<-scale(cust_base_final$age_in_years)[,1]
+cust_base_final$income_in_K_month_scaled<-scale(cust_base_final$income_in_K_month)[,1]
+cust_base_final$CCAvg_scaled<-scale(cust_base_final$CCAvg)[,1]
+cust_base_final$Mortgage_scaled<-scale(cust_base_final$Mortgage)[,1]
+
+#Create multiple subsets required for different steps in data analysis
+
+cust_base_scaled_fact<-cust_base_final[,c(27:30,15:16,18:21,25:26,17)]
+cust_base_orig_fact<-cust_base_final[,c(2,4,7,9,15:16,18:21,25:26,17)]
+cust_base_scaled_numeric<-cust_base_final[,c(27:30,6,8,11:14,23:24,10)]
+
+#Clustering
+#Calculate Gower distance
+
+gower_dist<-daisy(cust_base_scaled_fact[,-13],metric = "gower")
+
+#Calculate the optimum number of clusters to be created , using the elbow method
+
+fviz_nbclust(cust_base_scaled_numeric,pam,method = "wss",diss=gower_dist)+geom_vline(xintercept = 4, linetype = 2)+labs(subtitle = "Elbow method")
+
+#4 is the optimumm number of clusters suggested as per this method
+
+pam_fit_4 <- pam(gower_dist, diss = TRUE, k = 4)
+
+# profiling the clusters
+
+pam_results_4 <- cust_base_orig_fact %>%
+  mutate(cluster_id = pam_fit_4$clustering) %>%
+  group_by(cluster_id) %>%
+  do(overall_summary = summary(.))
+
+pam_results_4$overall_summary
+
+#Plot the clusters
+
+tsne_obj_4 <- Rtsne(gower_dist, is_distance = TRUE)
+tsne_data_4 <- tsne_obj_4$Y %>%
+  data.frame() %>%
+  setNames(c("X", "Y")) %>%
+  mutate(cluster = factor(pam_fit_4$clustering))
+ggplot(aes(x = X, y = Y), data = tsne_data_4) +
+  geom_point(aes(color = cluster))
+
+#If 6 is the optimumm number of clusters suggested as per this method
+
+pam_fit_6 <- pam(gower_dist, diss = TRUE, k = 6)
+
+# profiling the clusters
+
+pam_results_6 <- cust_base_orig_fact %>%
+  mutate(cluster_id = pam_fit_6$clustering) %>%
+  group_by(cluster_id) %>%
+  do(overall_summary = summary(.))
+
+View(pam_results_6$overall_summary)
+
+#Plot the clusters
+
+tsne_obj_6 <- Rtsne(gower_dist, is_distance = TRUE)
+tsne_data_6 <- tsne_obj_6$Y %>%
+  data.frame() %>%
+  setNames(c("X", "Y")) %>%
+  mutate(cluster = factor(pam_fit_6$clustering))
+ggplot(aes(x = X, y = Y), data = tsne_data_6) +
+  geom_point(aes(color = cluster))
+
+
+# Classification 
+# Create test and train data
+
+# 70% of the sample size
+sample_size <- floor(0.7 * nrow(cust_base_orig_fact))
+
+# set the seed to make the partition reproductible
+set.seed(4)
+train_ind <- sample(seq_len(nrow(cust_base_orig_fact)), size = sample_size)
+
+train_dataset <- cust_base_orig_fact[train_ind, ]
+test_dataset <- cust_base_orig_fact[-train_ind, ]
+
+#Check for uniformity of data in test and train
+
+sum(as.integer(as.character(train_dataset$did_accept_personal_loan_offer_fact))) / nrow(train_dataset)
+sum(as.integer(as.character(test_dataset$did_accept_personal_loan_offer_fact))) / nrow(test_dataset)
+sum(as.integer(as.character(cust_base_orig_fact$did_accept_personal_loan_offer_fact))) / nrow(cust_base_orig_fact)
+
+## CART
+
+#Get Control variable which would allow the tree to grow to maximum
+
+tree_control = rpart.control(minsplit=15, minbucket = 5, cp = 0, xval = 5)
+tree_iter1 <- rpart(formula = did_accept_personal_loan_offer_fact ~ .,data = train_dataset, method = "class", control = tree_control)
+
+# Plot the tree
+
+fancyRpartPlot(tree_iter1)
+
+# Find the CP to prune the tree
+printcp(tree_iter1)
+
+# Pruned tree
+
+ptree<- prune(tree_iter1, cp= 0.0095847 ,"CP")
+printcp(ptree)
+fancyRpartPlot(ptree, uniform=TRUE,  main="Pruned Classification Tree")
+
+
+# Evaluate the model
+
+#Define Decile function for rank ordering
+
+decile <- function(x){
+  deciles <- vector(length=10)
+  for (i in seq(0.1,1,.1)){
+    deciles[i*10] <- quantile(x, i, na.rm=T)
+  }
+  return (
+    ifelse(x<deciles[1], 1,
+           ifelse(x<deciles[2], 2,
+                  ifelse(x<deciles[3], 3,
+                         ifelse(x<deciles[4], 4,
+                                ifelse(x<deciles[5], 5,
+                                       ifelse(x<deciles[6], 6,
+                                              ifelse(x<deciles[7], 7,
+                                                     ifelse(x<deciles[8], 8,
+                                                            ifelse(x<deciles[9], 9, 10
+                                                            ))))))))))
+}
+
+
+
+train_dataset_perf_cart <-train_dataset
+
+# Get predicted class and probability based on the final pruned model arrived at fr train dataset
+
+train_dataset_perf_cart$predict.class <- predict(ptree, train_dataset_perf_cart, type="class")
+train_dataset_perf_cart$predict.score <- predict(ptree, train_dataset_perf_cart, type="prob")
+
+train_dataset_perf_cart$deciles <- decile(train_dataset_perf_cart$predict.score[,2])
+
+## Ranking code
+
+inter_datatable_train_cart = data.table(train_dataset_perf_cart)
+rank <- inter_datatable_train_cart[, list(
+  cnt = length(as.integer(as.character(did_accept_personal_loan_offer_fact))), 
+  cnt_resp = sum(as.integer(as.character(did_accept_personal_loan_offer_fact))), 
+  cnt_non_resp = sum(as.integer(as.character(did_accept_personal_loan_offer_fact)) == 0)) , 
+  by=deciles][order(-deciles)]
+
+rank$rrate <- round(rank$cnt_resp / rank$cnt,4);
+rank$cum_resp <- cumsum(rank$cnt_resp)
+rank$cum_non_resp <- cumsum(rank$cnt_non_resp)
+rank$cum_rel_resp <- round(rank$cum_resp  / sum(rank$cnt_resp),4);
+rank$cum_rel_non_resp <- round(rank$cum_non_resp  / sum(rank$cnt_non_resp),4);
+rank$rrate_perc <- percent(rank$rrate)
+rank$cum_rel_resp_perc <- percent(rank$cum_rel_resp)
+rank$cum_rel_non_resp_perc <- percent(rank$cum_rel_non_resp)
+rank$cum_cnt<-cumsum(rank$cnt)
+rank$cum_resp_rate<-round(rank$cum_resp  / rank$cum_cnt,4)
+overall_resp_rate<-sum(as.integer(as.character(train_dataset_perf_cart$did_accept_personal_loan_offer_fact)))/nrow(train_dataset_perf_cart)
+
+# Derive Lift
+
+rank$lift<-round(rank$cum_resp_rate/overall_resp_rate,2)
+
+# Get KS , AUC and Gini
+
+pred_train_cart <- prediction(train_dataset_perf_cart$predict.score[,2], train_dataset_perf_cart$did_accept_personal_loan_offer_fact)
+perf_train_cart <- performance(pred_train_cart, "tpr", "fpr")
+plot(perf_train_cart)
+KS_train_cart <- max(attr(perf_train_cart, 'y.values')[[1]]-attr(perf_train_cart, 'x.values')[[1]])
+
+auc_train_cart <- performance(pred,"auc"); 
+auc_train_cart <- as.numeric(auc@y.values)
+
+gini_train_cart = ineq(train_dataset_perf_cart$predict.score[,2], type="Gini")
+
+
+# Check for model perfromance measures on the same line based on test data 
+
+test_dataset_perf_cart <-test_dataset
+
+test_dataset_perf_cart$predict.class <- predict(ptree, test_dataset_perf_cart, type="class")
+test_dataset_perf_cart$predict.score <- predict(ptree, test_dataset_perf_cart, type="prob")
+
+test_dataset_perf_cart$deciles <- decile(test_dataset_perf_cart$predict.score[,2])
+
+## Ranking code
+
+inter_datatable_test_cart = data.table(test_dataset_perf_cart)
+rank_test_cart <- inter_datatable_test_cart[, list(
+  cnt = length(as.integer(as.character(did_accept_personal_loan_offer_fact))), 
+  cnt_resp = sum(as.integer(as.character(did_accept_personal_loan_offer_fact))), 
+  cnt_non_resp = sum(as.integer(as.character(did_accept_personal_loan_offer_fact)) == 0)) , 
+  by=deciles][order(-deciles)]
+
+rank_test_cart$rrate <- round(rank_test_cart$cnt_resp / rank_test_cart$cnt,4);
+rank_test_cart$cum_resp <- cumsum(rank_test_cart$cnt_resp)
+rank_test_cart$cum_non_resp <- cumsum(rank_test_cart$cnt_non_resp)
+rank_test_cart$cum_rel_resp <- round(rank_test_cart$cum_resp  / sum(rank_test_cart$cnt_resp),4);
+rank_test_cart$cum_rel_non_resp <- round(rank_test_cart$cum_non_resp  / sum(rank_test_cart$cnt_non_resp),4);
+rank_test_cart$rrate_perc <- percent(rank_test_cart$rrate)
+rank_test_cart$cum_rel_resp_perc <- percent(rank_test_cart$cum_rel_resp)
+rank_test_cart$cum_rel_non_resp_perc <- percent(rank_test_cart$cum_rel_non_resp)
+rank_test_cart$cum_cnt<-cumsum(rank_test_cart$cnt)
+rank_test_cart$cum_resp_rate<-round(rank_test_cart$cum_resp  / rank_test_cart$cum_cnt,4)
+
+overall_resp_rate_test<-sum(as.integer(as.character(test_dataset_perf_cart$did_accept_personal_loan_offer_fact)))/nrow(test_dataset_perf_cart)
+
+# Get Lift
+
+rank_test_cart$lift<-round(rank_test_cart$cum_resp_rate/overall_resp_rate_test,2)
+
+# Get KS , AUC and Gini
+
+pred_test <- prediction(test_dataset_perf_cart$predict.score[,2], test_dataset_perf_cart$did_accept_personal_loan_offer_fact)
+perf_test <- performance(pred_test, "tpr", "fpr")
+plot(perf_test)
+KS_test <- max(attr(perf_test, 'y.values')[[1]]-attr(perf_test, 'x.values')[[1]])
+auc_test <- performance(pred_test,"auc"); 
+auc_test <- as.numeric(auc_test@y.values)
+
+gini_test = ineq(test_dataset_perf_cart$predict.score[,2], type="Gini")
+
+# Random Forest
+
+# To start with following parameters were used
+
+#ntree : random number
+#mtry : square root of the number of predictor variable
+#nodesize : 10% of the number of records in training dataset
+
+tuned_rf <- tuneRF(x = train_dataset[,-13], 
+                   y=train_dataset$did_accept_personal_loan_offer_fact,
+                   mtryStart = 8, 
+                   ntreeTry=500, 
+                   stepFactor = 1.5, 
+                   improve = 0.001, 
+                   trace=T, 
+                   plot = T,
+                   doBest = TRUE,
+                   nodesize = 200, 
+                   importance=T
+)
+
+# Keep on tuning the parameters, and above is the final model
+
+random_forest <- randomForest(did_accept_personal_loan_offer_fact~ .,data = train_dataset,ntree=500, mtry = 8 , nodesize = 200,importance=TRUE)
+
+# Listing the importance of the variables.
+impVar <- round(randomForest::importance(random_forest), 2)
+impVar[order(impVar[,3], decreasing=TRUE),]
+
+# Plotting for arriving at the optimum number of trees
+
+plot(tuned_rf, main="")
+legend("topright", c("OOB", "0", "1"), text.col=1:6, lty=1:3, col=1:3)
+title(main="Error Rates Random Forest RFDF.dev")
+
+# Model performance measures
+
+# On training dataset
+
+train_perf_dataset<-train_dataset
+
+
+train_perf_dataset$predict.class <- predict(tuned_rf, train_dataset, type="class")
+train_perf_dataset$predict.score <- predict(tuned_rf, train_dataset, type="prob")
+train_perf_dataset$deciles <- decile(train_perf_dataset$predict.score[,2])
+
+inter_datatable_train = data.table(train_perf_dataset)
+train_rank <- inter_datatable_train[, list(
+  cnt = length(as.integer(as.character(did_accept_personal_loan_offer_fact))), 
+  cnt_resp = sum(as.integer(as.character(did_accept_personal_loan_offer_fact))), 
+  cnt_non_resp = sum(as.integer(as.character(did_accept_personal_loan_offer_fact)) == 0)) , 
+  by=deciles][order(-deciles)]
+train_rank$rrate <- round (train_rank$cnt_resp / train_rank$cnt,2)
+train_rank$cum_resp <- cumsum(train_rank$cnt_resp)
+train_rank$cum_non_resp <- cumsum(train_rank$cnt_non_resp)
+train_rank$cum_rel_resp <- round(train_rank$cum_resp / sum(train_rank$cnt_resp),2)
+train_rank$cum_rel_non_resp <- round(train_rank$cum_non_resp / sum(train_rank$cnt_non_resp),2)
+train_rank$rrate <- percent(train_rank$rrate)
+train_rank$cum_rel_resp <- percent(train_rank$cum_rel_resp)
+train_rank$cum_rel_non_resp <- percent(train_rank$cum_rel_non_resp)
+train_rank$cum_cnt<-cumsum(train_rank$cnt)
+train_rank$cum_resp_rate<-round(train_rank$cum_resp  / train_rank$cum_cnt,4)
+overall_resp_rate_test<-sum(as.integer(as.character(train_perf_dataset$did_accept_personal_loan_offer_fact)))/nrow(train_perf_dataset)
+
+# Get Lift
+
+train_rank$lift<-round(train_rank$cum_resp_rate/overall_resp_rate_test,2)
+
+# Get KS , AUC and Gini
+
+pred <- prediction(train_perf_dataset$predict.score[,2], train_perf_dataset$did_accept_personal_loan_offer_fact)
+perf <- performance(pred, "tpr", "fpr")
+KS <- max(attr(perf, 'y.values')[[1]]-attr(perf, 'x.values')[[1]])
+auc <- performance(pred,"auc"); 
+auc <- as.numeric(auc@y.values)
+gini = ineq(train_perf_dataset$predict.score[,2], type="Gini")
+
+
+#Model validation fon test dataset
+
+test_perf_dataset<-test_dataset
+
+test_perf_dataset$predict.class <- predict(tuned_rf, test_perf_dataset, type="class")
+test_perf_dataset$predict.score <- predict(tuned_rf, test_perf_dataset, type="prob")
+
+test_perf_dataset$deciles <- decile(test_perf_dataset$predict.score[,2])
+
+inter_datatable_test = data.table(test_perf_dataset)
+rank_test <- inter_datatable_test[, list(
+  cnt = length(as.integer(as.character(did_accept_personal_loan_offer_fact))), 
+  cnt_resp = sum(as.integer(as.character(did_accept_personal_loan_offer_fact))), 
+  cnt_non_resp = sum(as.integer(as.character(did_accept_personal_loan_offer_fact)) == 0)) , 
+  by=deciles][order(-deciles)]
+rank_test$rrate <- round (rank_test$cnt_resp / rank_test$cnt,2);
+rank_test$cum_resp <- cumsum(rank_test$cnt_resp)
+rank_test$cum_non_resp <- cumsum(rank_test$cnt_non_resp)
+rank_test$cum_rel_resp <- round(rank_test$cum_resp / sum(rank_test$cnt_resp),2);
+rank_test$cum_rel_non_resp <- round(rank_test$cum_non_resp / sum(rank_test$cnt_non_resp),2);
+rank_test$rrate <- percent(rank_test$rrate)
+rank_test$cum_rel_resp <- percent(rank_test$cum_rel_resp)
+rank_test$cum_rel_non_resp <- percent(rank_test$cum_rel_non_resp)
+rank_test$cum_cnt<-cumsum(rank_test$cnt)
+rank_test$cum_resp_rate<-round(rank_test$cum_resp  / rank_test$cum_cnt,4)
+overall_resp_rate_test<-sum(as.integer(as.character(test_perf_dataset$did_accept_personal_loan_offer_fact)))/nrow(test_perf_dataset)
+
+# Get lift
+
+rank_test$lift<-round(rank_test$cum_resp_rate/overall_resp_rate_test,2)
+
+# Get KS , AUC and Gini
+
+pred_test_rf <- prediction(test_perf_dataset$predict.score[,2], test_perf_dataset$did_accept_personal_loan_offer_fact)
+perf_test_rf <- performance(pred_test_rf, "tpr", "fpr")
+plot(perf)
+KS_test_rf <- max(attr(perf_test_rf, 'y.values')[[1]]-attr(perf_test_rf, 'x.values')[[1]])
+
+auc_test_rf <- performance(pred_test_rf,"auc"); 
+auc_test_rf <- as.numeric(auc_test_rf@y.values)
+
+gini_test_rf = ineq(test_perf_dataset$predict.score[,2], type="Gini")
+
+
+
+
+
+
+
+
